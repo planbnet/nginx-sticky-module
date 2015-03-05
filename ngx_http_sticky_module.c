@@ -36,6 +36,7 @@ typedef struct {
 	ngx_http_sticky_misc_text_pt  text;
 	ngx_uint_t                    no_fallback;
 	ngx_http_sticky_peer_t       *peers;
+	ngx_http_sticky_peer_t       *backup;
 } ngx_http_sticky_srv_conf_t;
 
 
@@ -45,6 +46,7 @@ typedef struct {
 	ngx_http_upstream_rr_peer_data_t   rrp;
 	ngx_event_get_peer_pt              get_rr_peer;
 	int                                selected_peer;
+	int                                selected_backup;
 	int                                no_fallback;
 	ngx_http_sticky_srv_conf_t        *sticky_conf;
 	ngx_http_request_t                *request;
@@ -108,11 +110,15 @@ ngx_module_t  ngx_http_sticky_module = {
 ngx_int_t ngx_http_init_upstream_sticky(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 {
 	ngx_http_upstream_rr_peers_t *rr_peers;
+	ngx_http_upstream_rr_peers_t *rr_backup;
 	ngx_http_sticky_srv_conf_t *conf;
 	ngx_uint_t i;
 
+	ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] initializing");
+
 	/* call the rr module on wich the sticky module is based on */
 	if (ngx_http_upstream_init_round_robin(cf, us) != NGX_OK) {
+		ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] no rr");
 		return NGX_ERROR;
 	}
 
@@ -120,7 +126,8 @@ ngx_int_t ngx_http_init_upstream_sticky(ngx_conf_t *cf, ngx_http_upstream_srv_co
 	rr_peers = us->peer.data;
 
 	/* do nothing there's only one peer */
-	if (rr_peers->number <= 1 || rr_peers->single) {
+	if (rr_peers->single ) {
+		ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] single mode");
 		return NGX_OK;
 	}
 
@@ -132,12 +139,15 @@ ngx_int_t ngx_http_init_upstream_sticky(ngx_conf_t *cf, ngx_http_upstream_srv_co
 	/* if 'index', no need to alloc and generate digest */
 	if (!conf->hash && !conf->hmac && !conf->text) {
 		conf->peers = NULL;
+		conf->backup = NULL;
+		ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] index");
 		return NGX_OK;
 	}
 
 	/* create our own upstream indexes */
 	conf->peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_sticky_peer_t) * rr_peers->number);
 	if (conf->peers == NULL) {
+		ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] cannot create peer structure");
 		return NGX_ERROR;
 	}
 
@@ -157,12 +167,33 @@ ngx_int_t ngx_http_init_upstream_sticky(ngx_conf_t *cf, ngx_http_upstream_srv_co
 			/* generate hash */
 			conf->hash(cf->pool, rr_peers->peer[i].sockaddr, rr_peers->peer[i].socklen, &conf->peers[i].digest);
 		}
+  }
 
-#if 0
-/* FIXME: is it possible to log to debug level when at configuration stage ? */
-		ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] generated digest \"%V\" for upstream at index %d", &conf->peers[i].digest, i);
-#endif
+	rr_backup = rr_peers->next;
+  if (rr_backup) {
+  	conf->backup = ngx_pcalloc(cf->pool, sizeof(ngx_http_sticky_peer_t) * rr_backup->number);
+	  if (conf->backup == NULL) {
+		  ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] cannot create backup structure");
+  		return NGX_ERROR;
+	  }
 
+    /* parse each backup peer and generate digest if necessary */
+    for (i = 0; i < rr_backup->number; i++) {
+      conf->backup[i].rr_peer = &rr_backup->peer[i];
+
+      if (conf->hmac) {
+        /* generate hmac */
+        conf->hmac(cf->pool, rr_backup->peer[i].sockaddr, rr_backup->peer[i].socklen, &conf->hmac_key, &conf->backup[i].digest);
+
+      } else if (conf->text) {
+        /* generate text */
+        conf->text(cf->pool, rr_backup->peer[i].sockaddr, &conf->backup[i].digest);
+
+      } else {
+        /* generate hash */
+        conf->hash(cf->pool, rr_backup->peer[i].sockaddr, rr_backup->peer[i].socklen, &conf->backup[i].digest);
+      }
+    }
 	}
 
 	return NGX_OK;
@@ -178,6 +209,7 @@ static ngx_int_t ngx_http_init_sticky_peer(ngx_http_request_t *r, ngx_http_upstr
 	ngx_str_t                     route;
 	ngx_uint_t                    i;
 	ngx_int_t                     n;
+	ngx_http_upstream_rr_peers_t *rr_backup;
 
 	/* alloc custom sticky struct */
 	iphp = ngx_palloc(r->pool, sizeof(ngx_http_sticky_peer_data_t));
@@ -199,6 +231,7 @@ static ngx_int_t ngx_http_init_sticky_peer(ngx_http_request_t *r, ngx_http_upstr
 	/* init the custom sticky struct */
 	iphp->get_rr_peer = ngx_http_upstream_get_round_robin_peer;
 	iphp->selected_peer = -1;
+	iphp->selected_backup = -1;
 	iphp->no_fallback = 0;
 	iphp->sticky_conf = ngx_http_conf_upstream_srv_conf(us, ngx_http_sticky_module);
 	iphp->request = r;
@@ -230,6 +263,31 @@ static ngx_int_t ngx_http_init_sticky_peer(ngx_http_request_t *r, ngx_http_upstr
 					/* we found a match */
 					iphp->selected_peer = i;
 					ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" matches peer at index %ui", &route, i);
+					return NGX_OK;
+				}
+			}
+
+			/* check internal struct has been set */
+			if (!iphp->sticky_conf->backup) {
+				/* log a warning, as it will continue without the sticky */
+				ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "[sticky/init_sticky_peer] internal backup peer struct has not been set");
+				return NGX_OK; /* return OK, in order to continue */
+			}
+
+      rr_backup = iphp->rrp.peers->next;
+
+			/* search the digest found in the cookie in the peer digest list */
+			for (i = 0; i < rr_backup->number; i++) {
+
+				/* ensure the both len are equal and > 0 */
+				if (iphp->sticky_conf->backup[i].digest.len != route.len || route.len <= 0) {
+					continue;
+				}
+
+				if (!ngx_strncmp(iphp->sticky_conf->backup[i].digest.data, route.data, route.len)) {
+					/* we found a match */
+					iphp->selected_backup = i;
+					ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" matches backup peer at index %ui", &route, i);
 					return NGX_OK;
 				}
 			}
@@ -272,13 +330,25 @@ static ngx_int_t ngx_http_get_sticky_peer(ngx_peer_connection_t *pc, void *data)
 	ngx_uint_t                    n, i;
 	ngx_http_upstream_rr_peer_t  *peer = NULL;
 
+	ngx_http_upstream_rr_peers_t *rr_original = NULL;
+
 	ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] get sticky peer, try: %ui, n_peers: %ui, no_fallback: %ui/%ui", pc->tries, iphp->rrp.peers->number, conf->no_fallback, iphp->no_fallback);
 
 	/* TODO: cached */
 
+  /* has the sticky module selected a backup peer, try to stay on in (session draining) */
+  if (iphp->rrp.peers->next) {
+	  if (iphp->selected_backup >= 0 && iphp->selected_backup < (ngx_int_t)iphp->rrp.peers->next->number) {
+		  ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] backup peer (%i) selected, switch peer structure to backup", iphp->selected_backup);
+      rr_original = iphp->rrp.peers;
+      iphp->rrp.peers = iphp->rrp.peers->next;
+      iphp->selected_peer = iphp->selected_backup;
+    }
+  }
+
 	/* has the sticky module already choosen a peer to connect to and is it a valid peer */
 	/* is there more than one peer (otherwise, no choices to make) */
-	if (iphp->selected_peer >= 0 && iphp->selected_peer < (ngx_int_t)iphp->rrp.peers->number && !iphp->rrp.peers->single) {
+	if (iphp->selected_peer >= 0 && iphp->selected_peer < (ngx_int_t)iphp->rrp.peers->number) {
 		ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] let's try the selected peer (%i)", iphp->selected_peer);
 
 		n = iphp->selected_peer / (8 * sizeof(uintptr_t));
@@ -335,7 +405,11 @@ static ngx_int_t ngx_http_get_sticky_peer(ngx_peer_connection_t *pc, void *data)
 
 	/* we have a valid peer, tell the upstream module to use it */
 	if (peer && selected_peer >= 0) {
-		ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] peer found at index %i", selected_peer);
+    if ( rr_original ) {
+		  ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] backup peer found at index %i", selected_peer);
+    } else {
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] peer found at index %i", selected_peer);
+    }
 
 		iphp->rrp.current = iphp->selected_peer;
 		pc->cached = 0;
@@ -347,7 +421,15 @@ static ngx_int_t ngx_http_get_sticky_peer(ngx_peer_connection_t *pc, void *data)
 		iphp->rrp.tried[n] |= m;
 
 	} else {
-		ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] no sticky peer selected, switch back to classic rr");
+
+    if ( rr_original ) {
+		  ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] sticky backup peer failed, revert to original peers and switch back to classic rr");
+      iphp->rrp.peers = rr_original;
+      iphp->selected_peer = -1;
+      iphp->selected_backup = -1;
+    } else {
+		  ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] no sticky peer selected, switch back to classic rr");
+    }
 
 		if (iphp->no_fallback) {
 			ngx_log_error(NGX_LOG_NOTICE, pc->log, 0, "[sticky/get_sticky_peer] No fallback in action !");
@@ -358,7 +440,7 @@ static ngx_int_t ngx_http_get_sticky_peer(ngx_peer_connection_t *pc, void *data)
 		if (ret != NGX_OK) {
 			ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] ngx_http_upstream_get_round_robin_peer returned %i", ret);
 			return ret;
-		}
+		} 
 
 		/* search for the choosen peer in order to set the cookie */
 		for (i = 0; i < iphp->rrp.peers->number; i++) {
@@ -693,6 +775,7 @@ static char *ngx_http_sticky_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 		| NGX_HTTP_UPSTREAM_MAX_FAILS
 		| NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
 		| NGX_HTTP_UPSTREAM_DOWN
+    | NGX_HTTP_UPSTREAM_BACKUP
     | NGX_HTTP_UPSTREAM_WEIGHT;
 
 	return NGX_CONF_OK;
