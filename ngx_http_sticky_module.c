@@ -114,8 +114,6 @@ ngx_int_t ngx_http_init_upstream_sticky(ngx_conf_t *cf, ngx_http_upstream_srv_co
 	ngx_http_sticky_srv_conf_t *conf;
 	ngx_uint_t i;
 
-	ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] initializing");
-
 	/* call the rr module on wich the sticky module is based on */
 	if (ngx_http_upstream_init_round_robin(cf, us) != NGX_OK) {
 		ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] no rr");
@@ -135,14 +133,6 @@ ngx_int_t ngx_http_init_upstream_sticky(ngx_conf_t *cf, ngx_http_upstream_srv_co
 	us->peer.init = ngx_http_init_sticky_peer;
 
 	conf = ngx_http_conf_upstream_srv_conf(us, ngx_http_sticky_module);
-
-	/* if 'index', no need to alloc and generate digest */
-	if (!conf->hash && !conf->hmac && !conf->text) {
-		conf->peers = NULL;
-		conf->backup = NULL;
-		ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "[sticky/ngx_http_init_upstream_sticky] index");
-		return NGX_OK;
-	}
 
 	/* create our own upstream indexes */
 	conf->peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_sticky_peer_t) * rr_peers->number);
@@ -208,7 +198,6 @@ static ngx_int_t ngx_http_init_sticky_peer(ngx_http_request_t *r, ngx_http_upstr
 	ngx_http_sticky_peer_data_t  *iphp;
 	ngx_str_t                     route;
 	ngx_uint_t                    i;
-	ngx_int_t                     n;
 	ngx_http_upstream_rr_peers_t *rr_backup;
 
 	/* alloc custom sticky struct */
@@ -241,70 +230,53 @@ static ngx_int_t ngx_http_init_sticky_peer(ngx_http_request_t *r, ngx_http_upstr
 		/* a route cookie has been found. Let's give it a try */
 		ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] got cookie route=%V, let's try to find a matching peer", &route);
 
-		/* hash, hmac or text, just compare digest */
-		if (iphp->sticky_conf->hash || iphp->sticky_conf->hmac || iphp->sticky_conf->text) {
+    /* check internal struct has been set */
+    if (!iphp->sticky_conf->peers) {
+      /* log a warning, as it will continue without the sticky */
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "[sticky/init_sticky_peer] internal peers struct has not been set");
+      return NGX_OK; /* return OK, in order to continue */
+    }
 
-			/* check internal struct has been set */
-			if (!iphp->sticky_conf->peers) {
-				/* log a warning, as it will continue without the sticky */
-				ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "[sticky/init_sticky_peer] internal peers struct has not been set");
-				return NGX_OK; /* return OK, in order to continue */
-			}
+    /* search the digest found in the cookie in the peer digest list */
+    for (i = 0; i < iphp->rrp.peers->number; i++) {
 
-			/* search the digest found in the cookie in the peer digest list */
-			for (i = 0; i < iphp->rrp.peers->number; i++) {
+      /* ensure the both len are equal and > 0 */
+      if (iphp->sticky_conf->peers[i].digest.len != route.len || route.len <= 0) {
+        continue;
+      }
 
-				/* ensure the both len are equal and > 0 */
-				if (iphp->sticky_conf->peers[i].digest.len != route.len || route.len <= 0) {
-					continue;
-				}
+      if (!ngx_strncmp(iphp->sticky_conf->peers[i].digest.data, route.data, route.len)) {
+        /* we found a match */
+        iphp->selected_peer = i;
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" matches peer at index %ui", &route, i);
+        return NGX_OK;
+      }
+    }
 
-				if (!ngx_strncmp(iphp->sticky_conf->peers[i].digest.data, route.data, route.len)) {
-					/* we found a match */
-					iphp->selected_peer = i;
-					ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" matches peer at index %ui", &route, i);
-					return NGX_OK;
-				}
-			}
+    /* check internal struct has been set */
+    if (!iphp->sticky_conf->backup) {
+      /* log a warning, as it will continue without the sticky */
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "[sticky/init_sticky_peer] internal backup peer struct has not been set");
+      return NGX_OK; /* return OK, in order to continue */
+    }
 
-			/* check internal struct has been set */
-			if (!iphp->sticky_conf->backup) {
-				/* log a warning, as it will continue without the sticky */
-				ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "[sticky/init_sticky_peer] internal backup peer struct has not been set");
-				return NGX_OK; /* return OK, in order to continue */
-			}
+    rr_backup = iphp->rrp.peers->next;
 
-      rr_backup = iphp->rrp.peers->next;
+    /* search the digest found in the cookie in the peer digest list */
+    for (i = 0; i < rr_backup->number; i++) {
 
-			/* search the digest found in the cookie in the peer digest list */
-			for (i = 0; i < rr_backup->number; i++) {
+      /* ensure the both len are equal and > 0 */
+      if (iphp->sticky_conf->backup[i].digest.len != route.len || route.len <= 0) {
+        continue;
+      }
 
-				/* ensure the both len are equal and > 0 */
-				if (iphp->sticky_conf->backup[i].digest.len != route.len || route.len <= 0) {
-					continue;
-				}
-
-				if (!ngx_strncmp(iphp->sticky_conf->backup[i].digest.data, route.data, route.len)) {
-					/* we found a match */
-					iphp->selected_backup = i;
-					ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" matches backup peer at index %ui", &route, i);
-					return NGX_OK;
-				}
-			}
-
-		} else {
-
-			/* switch back to index, just convert to integer and ensure it corresponds to a valid peer */
-			n = ngx_atoi(route.data, route.len);
-			if (n == NGX_ERROR) {
-				ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "[sticky/init_sticky_peer] unable to convert the route \"%V\" to an integer value", &route);
-			} else if (n >= 0 && n < (ngx_int_t)iphp->rrp.peers->number) {
-				/* found one */
-				ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" matches peer at index %i", &route, n);
-				iphp->selected_peer = n;
-				return NGX_OK;
-			}
-		}
+      if (!ngx_strncmp(iphp->sticky_conf->backup[i].digest.data, route.data, route.len)) {
+        /* we found a match */
+        iphp->selected_backup = i;
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" matches backup peer at index %ui", &route, i);
+        return NGX_OK;
+      }
+    }
 
 		/* nothing was found, just continue with rr */
 		ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[sticky/init_sticky_peer] the route \"%V\" does not match any peer. Just ignoring it ...", &route);
@@ -331,6 +303,7 @@ static ngx_int_t ngx_http_get_sticky_peer(ngx_peer_connection_t *pc, void *data)
 	ngx_http_upstream_rr_peer_t  *peer = NULL;
 
 	ngx_http_upstream_rr_peers_t *rr_original = NULL;
+  ngx_int_t                     found = 0;
 
 	ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] get sticky peer, try: %ui, n_peers: %ui, no_fallback: %ui/%ui", pc->tries, iphp->rrp.peers->number, conf->no_fallback, iphp->no_fallback);
 
@@ -425,8 +398,6 @@ static ngx_int_t ngx_http_get_sticky_peer(ngx_peer_connection_t *pc, void *data)
     if ( rr_original ) {
 		  ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] sticky backup peer failed, revert to original peers and switch back to classic rr");
       iphp->rrp.peers = rr_original;
-      iphp->selected_peer = -1;
-      iphp->selected_backup = -1;
     } else {
 		  ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] no sticky peer selected, switch back to classic rr");
     }
@@ -444,34 +415,19 @@ static ngx_int_t ngx_http_get_sticky_peer(ngx_peer_connection_t *pc, void *data)
 
 		/* search for the choosen peer in order to set the cookie */
 		for (i = 0; i < iphp->rrp.peers->number; i++) {
-
 			if (iphp->rrp.peers->peer[i].sockaddr == pc->sockaddr && iphp->rrp.peers->peer[i].socklen == pc->socklen) {
-				if (conf->hash || conf->hmac || conf->text) {
-					ngx_http_sticky_misc_set_cookie(iphp->request, &conf->cookie_name, &conf->peers[i].digest, &conf->cookie_domain, &conf->cookie_path, conf->cookie_expires, conf->cookie_secure, conf->cookie_httponly);
-					ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] set cookie \"%V\" value=\"%V\" index=%ui", &conf->cookie_name, &conf->peers[i].digest, i);
-				} else {
-					ngx_str_t route;
-					ngx_uint_t tmp = i;
-					route.len = 0;
-					do {
-						route.len++;
-					} while (tmp /= 10);
-					route.data = ngx_pcalloc(iphp->request->pool, sizeof(u_char) * (route.len + 1));
-					if (route.data == NULL) {
-						break;
-					}
-					ngx_snprintf(route.data, route.len, "%d", i);
-					route.len = ngx_strlen(route.data);
-					ngx_http_sticky_misc_set_cookie(iphp->request, &conf->cookie_name, &route, &conf->cookie_domain, &conf->cookie_path, conf->cookie_expires, conf->cookie_secure, conf->cookie_httponly);
-					ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] set cookie \"%V\" value=\"%V\" index=%ui", &conf->cookie_name, &tmp, i);
-				}
+				ngx_http_sticky_misc_set_cookie(iphp->request, &conf->cookie_name, &conf->peers[i].digest, &conf->cookie_domain, &conf->cookie_path, conf->cookie_expires, conf->cookie_secure, conf->cookie_httponly);
+				ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[sticky/get_sticky_peer] set cookie \"%V\" value=\"%V\" index=%ui", &conf->cookie_name, &conf->peers[i].digest, i);
+        found = 1;
 				break; /* found and hopefully the cookie have been set */
 			}
 		}
+
 	}
 
 	/* reset the selection in order to bypass the sticky module when the upstream module will try another peers if necessary */
 	iphp->selected_peer = -1;
+  iphp->selected_backup = -1;
 
 	return NGX_OK;
 }
@@ -638,12 +594,6 @@ static char *ngx_http_sticky_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 			tmp.len =  value[i].len - ngx_strlen("hash=");
 			tmp.data = (u_char *)(value[i].data + sizeof("hash=") - 1);
 
-			/* is hash=index */
-			if (ngx_strncmp(tmp.data, "index", sizeof("index") - 1) == 0 ) {
-				hash = NULL;
-				continue;
-			}
-
 			/* is hash=md5 */
 			if (ngx_strncmp(tmp.data, "md5", sizeof("md5") - 1) == 0 ) {
 				hash = ngx_http_sticky_misc_md5;
@@ -656,7 +606,7 @@ static char *ngx_http_sticky_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 				continue;
 			}
 
-			ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "wrong value for \"hash=\": index, md5 or sha1");
+			ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "wrong value for \"hash=\": md5 or sha1");
 			return NGX_CONF_ERROR;
 		}
 
